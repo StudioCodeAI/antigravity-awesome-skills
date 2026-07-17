@@ -12,7 +12,7 @@ name: Auto Sync Fork
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # a cada 30 min (UTC; a execução do cron é best-effort)
+    - cron: "0 6 * * 1"      # semanal (segunda, 06:00 UTC; ~a cada 7 dias)
   workflow_dispatch:          # botão manual "Run workflow" na aba Actions
 
 permissions:
@@ -31,6 +31,21 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BRANCH="$(gh api "repos/${GITHUB_REPOSITORY}" --jq .default_branch)"
+          UPSTREAM_REPO="$(gh api "repos/${GITHUB_REPOSITORY}" --jq '.parent.full_name // empty')"
+
+          if [ -z "${UPSTREAM_REPO}" ]; then
+            echo "Este repositório não é um fork com upstream configurado; nada para sincronizar."
+            exit 0
+          fi
+
+          FORK_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BRANCH}" --jq .sha)"
+          UPSTREAM_SHA="$(gh api "repos/${UPSTREAM_REPO}/commits/${BRANCH}" --jq .sha)"
+
+          if [ "${FORK_SHA}" = "${UPSTREAM_SHA}" ]; then
+            echo "Sem mudanças no upstream (${UPSTREAM_REPO}:${BRANCH}); sincronização não é necessária."
+            exit 0
+          fi
+
           echo "-> Sincronizando ${GITHUB_REPOSITORY} (branch ${BRANCH}) com o upstream..."
           if gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch="${BRANCH}"; then
             echo "OK: fork sincronizado (ou ja estava atualizado)."
