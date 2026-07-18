@@ -12,7 +12,7 @@ name: Auto Sync Fork
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # a cada 30 min (UTC; a execução do cron é best-effort)
+    - cron: "0 0 * * 0"   # Executa a meia-noite de domingo
   workflow_dispatch:          # botão manual "Run workflow" na aba Actions
 
 permissions:
