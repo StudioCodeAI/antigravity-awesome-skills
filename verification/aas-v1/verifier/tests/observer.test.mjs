@@ -1,6 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { macObserverBudgets, parseDelimitedObserver, parseLinuxStrace, parseMacCombinedFsUsage, parseMacFsUsage, windowsObserverBudgets } from "../lib/observer.mjs";
+import { macObserverBudgets, parseDelimitedObserver, parseLinuxStrace, parseMacCombinedFsUsage, parseMacFsUsage, rewriteMacObservedNodeInput, windowsObserverBudgets } from "../lib/observer.mjs";
+import { runProcess } from "../lib/process.mjs";
+
+test("process runner distinguishes observer cleanup kills from timeouts", async () => {
+  const externallyKilled = await runProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    timeoutMs: 5_000,
+    onSpawn(child) { setTimeout(() => child.kill("SIGKILL"), 25); },
+  });
+  assert.equal(externallyKilled.signal, "SIGKILL");
+  assert.equal(externallyKilled.timedOut, false);
+  const timedOut = await runProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { timeoutMs: 25 });
+  assert.equal(timedOut.signal, "SIGKILL");
+  assert.equal(timedOut.timedOut, true);
+});
 
 test("strace parser counts failed network attempts and non-stream writes", () => {
   const result = parseLinuxStrace([
@@ -8,6 +21,9 @@ test("strace parser counts failed network attempts and non-stream writes", () =>
     'connect(7<TCP:[1]>, {sa_family=AF_INET}, 16) = -1 ECONNREFUSED',
     'openat(AT_FDCWD, "/tmp/x", O_WRONLY|O_CREAT, 0600) = 8',
     'write(8</tmp/x>, "x", 1) = 1',
+    'write(5<pipe:[123]>, "x", 1) = 1',
+    'write(6<anon_inode:[eventfd]>, "x", 1) = 1',
+    'write(7</dev/null>, "x", 1) = 1',
     'write(1</dev/pts/1>, "ok", 2) = 2',
     'execve("/bin/true", ["true"], 0x0) = 0',
   ].join("\n"), { tmp: "/tmp" });
@@ -34,11 +50,12 @@ test("Windows observer separates the candidate limit from ETW finalization grace
 test("macOS observer lifetime covers readiness, candidate, drain, and stop margin", () => {
   assert.deepEqual(macObserverBudgets(10_000), {
     startupMs: 1_500,
-    readinessMaxAttempts: 2,
+    readinessMaxAttempts: 4,
     readinessProcessTimeoutMs: 10_000,
-    readinessDelayMs: 250,
+    readinessDelayMs: 500,
     drainMs: 1_000,
-    observerTimeoutMs: 38_000,
+    traceMaxOutputBytes: 64 * 1024 * 1024,
+    observerTimeoutMs: 59_500,
   });
   assert.throws(() => macObserverBudgets(0), (error) => error.code === "AAS_OBSERVER_INVALID_TIMEOUT");
 });
@@ -63,6 +80,31 @@ test("combined macOS fs_usage parser enforces canary ordering and classifies can
     "12:00:00.040 posix_spawn child node.1",
   ].join("\n"), {}, "aas-ready-1", "aas-start-1");
   assert.deepEqual([result.networkAttempts, result.writeAttempts, result.childProcesses], [1, 1, 1]);
+  const bufferedOutOfOrder = parseMacCombinedFsUsage([
+    "12:00:02.030 connect 127.0.0.1:9 node.1",
+    "12:00:02.020 WrData[A] F=3 /tmp/candidate-output node.1",
+    "12:00:00.005 WrData[A] F=3 /tmp/aas-ready-1 aasobs.1",
+    "12:00:02.010 WrData[A] F=3 /tmp/aas-start-1 aasobs.1",
+  ].join("\n"), {}, "aas-ready-1", "aas-start-1");
+  assert.deepEqual([bufferedOutOfOrder.networkAttempts, bufferedOutOfOrder.writeAttempts], [1, 1]);
+  const midnightWrap = parseMacCombinedFsUsage([
+    "00:00:00.250 connect 127.0.0.1:9 node.1",
+    "23:59:59.900 WrData[A] F=3 /tmp/aas-ready-1 aasobs.1",
+    "00:00:00.100 WrData[A] F=3 /tmp/aas-start-1 aasobs.1",
+    "00:00:00.200 WrData[A] F=3 /tmp/candidate-output node.1",
+  ].join("\n"), {}, "aas-ready-1", "aas-start-1");
+  assert.deepEqual([midnightWrap.networkAttempts, midnightWrap.writeAttempts], [1, 1]);
   assert.throws(() => parseMacCombinedFsUsage("12:00:00.010 WrData[A] F=3 /tmp/aas-start-1 aasobs.1\n", {}, "aas-ready-1", "aas-start-1"), /readiness canary/);
   assert.throws(() => parseMacCombinedFsUsage("12:00:00.010 WrData[A] F=3 /tmp/aas-ready-1 aasobs.1\n", {}, "aas-ready-1", "aas-start-1"), /candidate start canary/);
+});
+
+test("macOS observer keeps transaction children inside its native process filter", () => {
+  const input = JSON.stringify({ executable: "/usr/local/bin/node", args: ["candidate.js"], untouched: true });
+  assert.deepEqual(JSON.parse(rewriteMacObservedNodeInput(input, "/usr/local/bin/node", "/tmp/aasobs123")), {
+    executable: "/tmp/aasobs123",
+    args: ["candidate.js"],
+    untouched: true,
+  });
+  assert.equal(rewriteMacObservedNodeInput(input, "/other/node", "/tmp/aasobs123"), input);
+  assert.equal(rewriteMacObservedNodeInput("not-json", "/usr/local/bin/node", "/tmp/aasobs123"), "not-json");
 });
